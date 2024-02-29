@@ -1,0 +1,306 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  EnableCWLoggingForRoute53:
+    Type: String
+    Description: Enable CW Logging for Route53?
+    Default: 'Yes'
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+Conditions:
+  ConditionEnableCWLoggingForRoute53: !Equals
+    - !Ref EnableCWLoggingForRoute53
+    - 'Yes'
+Resources:
+  ConfigPermissionToCallLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EnableCWLoggingForRoute53Function.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+  EnableCWLoggingForRoute53Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import botocore
+          import boto3
+          import json
+
+          ASSUME_ROLE_MODE = False
+          DEFAULT_RESOURCE_TYPE = 'AWS::Route53::HostedZone'
+
+          def get_client(service, event):
+              if not ASSUME_ROLE_MODE:
+                  return boto3.client(service)
+              credentials = get_assume_role_credentials(event["executionRoleArn"])
+              return boto3.client(service,
+                                  aws_access_key_id=credentials['AccessKeyId'],
+                                  aws_secret_access_key=credentials['SecretAccessKey'],
+                                  aws_session_token=credentials['SessionToken'])
+
+          def get_assume_role_credentials(role_arn):
+              sts_client = boto3.client('sts')
+              try:
+                  assume_role_response = sts_client.assume_role(RoleArn=role_arn, RoleSessionName="configLambdaExecution")
+                  return assume_role_response['Credentials']
+              except botocore.exceptions.ClientError as ex:
+                  if 'AccessDenied' in ex.response['Error']['Code']:
+                      ex.response['Error']['Message'] = "AWS Config does not have permission to assume the IAM role."
+                  else:
+                      ex.response['Error']['Message'] = "InternalError"
+                      ex.response['Error']['Code'] = "InternalError"
+                  raise ex
+
+          def count_route53_zones():
+              route53 = boto3.client('route53')
+              response = route53.list_hosted_zones()
+              zones = response.get('HostedZones', [])
+              while 'NextToken' in response:
+                  response = route53.list_hosted_zones(NextToken=response['NextToken'])
+                  zones.extend(response.get('HostedZones', []))
+              return len(zones)
+
+          def count_logging_enabled_zones():
+              route53 = boto3.client('route53')
+              count = 0
+              response = route53.list_hosted_zones()
+              for zone in response['HostedZones']:
+                  try:
+                      log_configs = route53.get_query_logging_config(Id=zone['Id'])
+                      if log_configs.get('CloudWatchLogsLogGroupArn'):
+                          count += 1
+                  except botocore.exceptions.ClientError as ex:
+                      if ex.response['Error']['Code'] != 'NoSuchQueryLoggingConfig':
+                          raise ex
+              return count
+
+          def evaluate_compliance(max_count, actual_count):
+              # You might implement a desired ratio as well
+              return 'NON_COMPLIANT' if actual_count < max_count else 'COMPLIANT'
+
+          def evaluate_parameters(rule_parameters):
+              # Example rule parameter: Require all zones to have logging enabled
+              if 'requireAllZones' in rule_parameters:
+                  return {'requireAllZones': rule_parameters['requireAllZones']}
+              else:
+                  return {'requireAllZones': False}
+
+          def build_evaluation(resource_id, compliance_type, event, resource_type=DEFAULT_RESOURCE_TYPE, annotation=None):
+              eval_cc = {}
+              if annotation:
+                  eval_cc['Annotation'] = annotation
+              eval_cc['ComplianceResourceType'] = resource_type
+              eval_cc['ComplianceResourceId'] = resource_id
+              eval_cc['ComplianceType'] = compliance_type
+              eval_cc['OrderingTimestamp'] = str(json.loads(event['invokingEvent'])['notificationCreationTime'])
+              return eval_cc
+
+          def lambda_handler(event, context):
+              global AWS_CONFIG_CLIENT
+              evaluations = []
+              rule_parameters = {}
+              invoking_event = json.loads(event['invokingEvent'])
+
+              if 'ruleParameters' in event:
+                  rule_parameters = json.loads(event['ruleParameters'])
+
+              valid_rule_parameters = evaluate_parameters(rule_parameters)
+
+              max_count = count_route53_zones()
+              actual_count = count_logging_enabled_zones()
+              compliance_value = evaluate_compliance(max_count, actual_count)
+
+              # Additional logic based on 'requireAllZones'
+              if valid_rule_parameters['requireAllZones'] and compliance_value != 'COMPLIANT':
+                  annotation = 'Route53 Query Logging is not enabled on all zones'
+              else:
+                  annotation = None
+
+              if event.get('resourceType') != DEFAULT_RESOURCE_TYPE:
+                  evaluations.append(build_evaluation(event['accountId'], compliance_value, event, resource_type=DEFAULT_RESOURCE_TYPE, annotation=annotation))
+
+              AWS_CONFIG_CLIENT = get_client('config', event)
+              response = AWS_CONFIG_CLIENT.put_evaluations(Evaluations=evaluations, ResultToken=event['resultToken'])
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+  EnableCWLoggingForRoute53Rule:
+    Condition: ConditionEnableCWLoggingForRoute53
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: EnableCWLoggingForRoute53EnabledWithRemediation
+      Description: Check if CW Logging for Route53 is enabled.
+      MaximumExecutionFrequency: TwentyFour_Hours
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceDetails:
+          - EventSource: aws.config
+            MaximumExecutionFrequency: TwentyFour_Hours
+            MessageType: ScheduledNotification
+        SourceIdentifier: !GetAtt EnableCWLoggingForRoute53Function.Arn
+    DependsOn: ConfigPermissionToCallLambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaExecutionPolicy
+  LambdaExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - config:PutEvaluations
+              - config:Get*
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - route53:ListHostedZones
+              - route53:GetQueryLoggingConfig
+            Resource: '*'
+  Route53LoggingAutomationManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - route53:GetQueryLoggingConfig
+              - route53:CreateQueryLoggingConfig
+              - route53:ListHostedZones
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: arn:aws:logs:*:*:*
+  Route53LoggingEncryptionAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+                - iam.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref Route53LoggingAutomationManagedPolicy
+  Route53LoggingEncryptionAutomationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        description: Checks if CW Logging for Route53 is enable, if not it will create a log group and send the logs there.
+        schemaVersion: '0.3'
+        assumeRole: !Sub ${Route53LoggingEncryptionAutomationRole.Arn}
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to execute this document.
+            default: !Sub ${Route53LoggingEncryptionAutomationRole.Arn}
+        mainSteps:
+          - name: enable_route53_logging
+            description: Checks if CW Logging for Route53 is enable, if not it will create a log group and send the logs there.
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: script_handler
+              Script: !Sub |-
+                import boto3
+                import logging
+
+                logger = logging.getLogger()
+                logger.setLevel(logging.INFO)
+
+                route53 = boto3.client('route53')
+                logs = boto3.client('logs', region_name='us-east-1')
+
+                def create_log_group(log_group_name):
+                    try:
+                        logs.create_log_group(logGroupName=log_group_name, retentionInDays=60)
+                        logger.info(f"Created CloudWatch Log Group: {log_group_name}")
+                    except logs.exceptions.ResourceAlreadyExistsException:
+                        logger.info(f"CloudWatch Log Group {log_group_name} already exists.")
+                    except Exception as e:
+                        logger.error(f"Error creating Log Group: {e}")
+                        raise e
+
+                def enable_route53_logging(zone_id, log_group_name):
+                    try:
+                        # Attempt to fetch existing configuration
+                        route53.get_query_logging_config(Id=zone_id)
+
+                        # If it exists, simply log this fact
+                        logger.info(f"Route 53 Logging for Zone {zone_id} is already configured")
+
+                    except route53.exceptions.NoSuchQueryLoggingConfig:
+                        # Configuration doesn't exist; proceed to create log group and enable logging
+                        create_log_group(log_group_name)
+                        config = {
+                        'CloudWatchLogsLogGroupArn': f"arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:{log_group_name}:*"
+                    	}
+                        print (config['CloudWatchLogsLogGroupArn'])
+                        logger.debug(f"Constructed ARN: {config['CloudWatchLogsLogGroupArn']}")  # Add this line
+                        route53.create_query_logging_config(HostedZoneId=zone_id, CloudWatchLogsLogGroupArn=config['CloudWatchLogsLogGroupArn'])
+                        logger.info(f"Enabled Route 53 Query Logging for Zone {zone_id}")
+
+                    except Exception as e:
+                        logger.error(f"Error enabling logging: {e}")
+                        raise e
+
+
+                def script_handler(event, context):
+                    response = route53.list_hosted_zones()
+                    print (response)
+                    for zone in response['HostedZones']:
+                        zone_id = zone['Id'].replace('/hostedzone/', '')
+                        print (zone_id)
+                        zone_name = zone['Name']
+                        print (zone_name)
+                        log_group_name = f"/aws/route53/{zone_name.rstrip('.')}"  # Ensure trailing dot is removed for log group name
+                        print (log_group_name)
+
+                        enable_route53_logging(zone_id, log_group_name)
+      DocumentType: Automation
+  EnableCWLoggingForRoute53Remediation:
+    Condition: ConditionEnableCWLoggingForRoute53
+    DependsOn: EnableCWLoggingForRoute53Rule
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref EnableCWLoggingForRoute53Rule
+      TargetId: !Ref Route53LoggingEncryptionAutomationDocument
+      TargetType: SSM_DOCUMENT
+      TargetVersion: '1'
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !Sub ${Route53LoggingEncryptionAutomationRole.Arn}
+      Automatic: true
+      MaximumAutomaticAttempts: 10
+      RetryAttemptSeconds: 600
